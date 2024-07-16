@@ -9,16 +9,16 @@ import wandb
 from termcolor import cprint
 from tqdm import tqdm
 
+# 追加: WaveNetのインポート
 from src.datasets import ThingsMEGDataset
-from src.models import BasicConvClassifier
+from src.models import WaveNet
 from src.utils import set_seed
-
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def run(args: DictConfig):
     set_seed(args.seed)
     logdir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
-    
+
     if args.use_wandb:
         wandb.init(mode="online", dir=logdir, project="MEG-classification")
 
@@ -39,23 +39,39 @@ def run(args: DictConfig):
     # ------------------
     #       Model
     # ------------------
-    model = BasicConvClassifier(
-        train_set.num_classes, train_set.seq_len, train_set.num_channels
-    ).to(args.device)
+    # BasicConvClassifierを使用する場合
+    # model = BasicConvClassifier(
+    #     train_set.num_classes, train_set.seq_len, train_set.num_channels
+    # ).to(args.device)
+    
+    # LSTMClassifierを使用する場合
+    # input_size = train_set.num_channels
+    # model = LSTMClassifier(num_classes=train_set.num_classes, input_size=input_size).to(args.device)
+    
+    # WaveNetを使用する場合
+    model = WaveNet(in_channels=train_set.num_channels, res_channels=32, num_classes=train_set.num_classes).to(args.device)
+    
+#     # 保存されたベストモデルのパラメータをロード
+#     if os.path.exists(args.model_path):
+#         model.load_state_dict(torch.load(args.model_path, map_location=args.device))
+#         print(f"Loaded best model parameters from {args.model_path}")
+#     else:
+#         print(f"Best model parameters not found at {args.model_path}. Starting training from scratch.")
 
     # ------------------
-    #     Optimizer
+    #   Optimizer
     # ------------------
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
+    
     # ------------------
-    #   Start training
-    # ------------------  
+    #  Training Loop
+    # ------------------
     max_val_acc = 0
     accuracy = Accuracy(
         task="multiclass", num_classes=train_set.num_classes, top_k=10
     ).to(args.device)
-      
+
     for epoch in range(args.epochs):
         print(f"Epoch {epoch+1}/{args.epochs}")
         
@@ -86,21 +102,19 @@ def run(args: DictConfig):
             
             val_loss.append(F.cross_entropy(y_pred, y).item())
             val_acc.append(accuracy(y_pred, y).item())
-
+            
+        scheduler.step(np.mean(val_loss))
+        
         print(f"Epoch {epoch+1}/{args.epochs} | train loss: {np.mean(train_loss):.3f} | train acc: {np.mean(train_acc):.3f} | val loss: {np.mean(val_loss):.3f} | val acc: {np.mean(val_acc):.3f}")
         torch.save(model.state_dict(), os.path.join(logdir, "model_last.pt"))
         if args.use_wandb:
             wandb.log({"train_loss": np.mean(train_loss), "train_acc": np.mean(train_acc), "val_loss": np.mean(val_loss), "val_acc": np.mean(val_acc)})
-        
+
         if np.mean(val_acc) > max_val_acc:
             cprint("New best.", "cyan")
             torch.save(model.state_dict(), os.path.join(logdir, "model_best.pt"))
             max_val_acc = np.mean(val_acc)
-            
-    
-    # ----------------------------------
-    #  Start evaluation with best model
-    # ----------------------------------
+
     model.load_state_dict(torch.load(os.path.join(logdir, "model_best.pt"), map_location=args.device))
 
     preds = [] 
@@ -111,7 +125,6 @@ def run(args: DictConfig):
     preds = torch.cat(preds, dim=0).numpy()
     np.save(os.path.join(logdir, "submission"), preds)
     cprint(f"Submission {preds.shape} saved at {logdir}", "cyan")
-
 
 if __name__ == "__main__":
     run()

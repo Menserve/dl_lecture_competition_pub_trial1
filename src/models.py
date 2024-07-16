@@ -1,76 +1,58 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from einops.layers.torch import Rearrange
 
-
-class BasicConvClassifier(nn.Module):
-    def __init__(
-        self,
-        num_classes: int,
-        seq_len: int,
-        in_channels: int,
-        hid_dim: int = 128
-    ) -> None:
-        super().__init__()
-
-        self.blocks = nn.Sequential(
-            ConvBlock(in_channels, hid_dim),
-            ConvBlock(hid_dim, hid_dim),
-        )
-
-        self.head = nn.Sequential(
-            nn.AdaptiveAvgPool1d(1),
-            Rearrange("b d 1 -> b d"),
-            nn.Linear(hid_dim, num_classes),
-        )
-
-    def forward(self, X: torch.Tensor) -> torch.Tensor:
-        """_summary_
-        Args:
-            X ( b, c, t ): _description_
-        Returns:
-            X ( b, num_classes ): _description_
-        """
-        X = self.blocks(X)
-
-        return self.head(X)
-
-
-class ConvBlock(nn.Module):
-    def __init__(
-        self,
-        in_dim,
-        out_dim,
-        kernel_size: int = 3,
-        p_drop: float = 0.1,
-    ) -> None:
-        super().__init__()
-        
-        self.in_dim = in_dim
-        self.out_dim = out_dim
-
-        self.conv0 = nn.Conv1d(in_dim, out_dim, kernel_size, padding="same")
-        self.conv1 = nn.Conv1d(out_dim, out_dim, kernel_size, padding="same")
-        # self.conv2 = nn.Conv1d(out_dim, out_dim, kernel_size) # , padding="same")
-        
-        self.batchnorm0 = nn.BatchNorm1d(num_features=out_dim)
-        self.batchnorm1 = nn.BatchNorm1d(num_features=out_dim)
-
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, dilation, p_drop=0.4):
+        super(ResidualBlock, self).__init__()
+        self.dilated_conv = nn.Conv1d(in_channels, out_channels, kernel_size=2, dilation=dilation, padding=dilation)
+        self.conv_res = nn.Conv1d(out_channels, in_channels, kernel_size=1)
+        self.conv_skip = nn.Conv1d(out_channels, in_channels, kernel_size=1)
+        self.batch_norm = nn.BatchNorm1d(out_channels)
+        self.relu = nn.ReLU()
         self.dropout = nn.Dropout(p_drop)
 
-    def forward(self, X: torch.Tensor) -> torch.Tensor:
-        if self.in_dim == self.out_dim:
-            X = self.conv0(X) + X  # skip connection
-        else:
-            X = self.conv0(X)
+    def forward(self, x):
+        out = self.dilated_conv(x)
+        out = self.batch_norm(out)
+        out = self.relu(out)
+        out = self.dropout(out)
+        
+        res = self.conv_res(out)
+        skip = self.conv_skip(out)
+        
+        if res.size(2) != x.size(2):
+            res = res[:, :, :x.size(2)]
+        if skip.size(2) != x.size(2):
+            skip = skip[:, :, :x.size(2)]
+        
+        return res + x, skip
 
-        X = F.gelu(self.batchnorm0(X))
+class WaveNet(nn.Module):
+    def __init__(self, in_channels, res_channels, num_classes, dilation_cycles=10, layers_per_cycle=10, p_drop=0.4):
+        super(WaveNet, self).__init__()
+        self.residual_blocks = nn.ModuleList()
+        for cycle in range(dilation_cycles):
+            for layer in range(layers_per_cycle):
+                dilation = 2 ** layer
+                self.residual_blocks.append(ResidualBlock(in_channels, res_channels, dilation, p_drop))
+        self.relu = nn.ReLU()
+        self.final_conv = nn.Conv1d(in_channels, in_channels, kernel_size=1)
+        self.batch_norm = nn.BatchNorm1d(in_channels)
+        self.dropout = nn.Dropout(p_drop)
+        self.fc = nn.Linear(in_channels, num_classes)
 
-        X = self.conv1(X) + X  # skip connection
-        X = F.gelu(self.batchnorm1(X))
-
-        # X = self.conv2(X)
-        # X = F.glu(X, dim=-2)
-
-        return self.dropout(X)
+    def forward(self, x):
+        skip_connections = []
+        for block in self.residual_blocks:
+            x, skip = block(x)
+            skip_connections.append(skip)
+        min_len = min([skip.size(2) for skip in skip_connections])
+        skip_connections = [skip[:, :, :min_len] for skip in skip_connections]
+        out = sum(skip_connections)
+        out = self.relu(out)
+        out = self.final_conv(out)
+        out = self.batch_norm(out)
+        out = torch.mean(out, dim=2)
+        out = self.dropout(out)
+        out = self.fc(out)
+        return out
